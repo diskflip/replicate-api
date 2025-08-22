@@ -1,0 +1,13 @@
+{
+  "functions": {
+    "api/generate.js": {
+      "maxDuration": 30
+    },
+    "api/index.js": {
+      "maxDuration": 10
+    }
+  },
+  "env": {
+    "NODE_ENV": "production"
+  }
+}
