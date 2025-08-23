@@ -9,7 +9,9 @@ const supabase = createClient(
   process.env.SUPABASE_SERVICE_KEY,
 );
 
-const MODEL_ID = "black-forest-labs/flux-dev";
+// Pruna AI's optimized Flux.1-dev
+const MODEL_ID = "prunaai/flux.1-dev:b0306d92aa025bb747dc74162f3c27d6ed83798e08e5f8977adf3d859d0536a3";
+
 const DISABLE_SAFETY =
   (process.env.DISABLE_SAFETY ?? "").toLowerCase() === "true" ||
   process.env.NODE_ENV !== "production";
@@ -39,44 +41,47 @@ export default async function handler(req, res) {
         .json({ error: "prompt, userId, characterId required" });
     }
 
+    // Updated input for Pruna AI's Flux.1-dev with lightly juiced for better quality
     const input = {
       prompt,
-      aspect_ratio: "9:16",
-      go_fast: false,
-      guidance: 2.5,
-      megapixels: "1", // flux-dev only allows "1" or "0.25"
-      num_outputs: 1,
-      output_format: "webp",
-      output_quality: 100,
-      num_inference_steps: 50,
-      disable_safety_checker: DISABLE_SAFETY,
+      aspect_ratio: "9:16",  // Perfect for dating app portraits
+      speed_mode: "Lightly Juiced ⚡ (less speed)",  // Better quality, still fast
+      guidance: 3.5,  // Their default guidance
+      image_size: 1024,  // Base size for good quality
+      num_inference_steps: 28,  // Their recommended steps
+      output_format: "webp",  // Efficient format
+      output_quality: 80,  // 80% quality as requested
+      seed: -1,  // Random seed for variety
       ...(clientInput || {}),
     };
 
-    if (input.megapixels !== "1" && input.megapixels !== "0.25") {
-      input.megapixels = "1";
-    }
+    console.log(`[Pruna Flux] Generating for character ${characterId} with speed mode: ${input.speed_mode}`);
+    console.log(`[Pruna Flux] Prompt preview: ${prompt.substring(0, 100)}...`);
 
-    console.log(`Generating image for character ${characterId} with prompt:`, prompt.substring(0, 100));
-
+    const startTime = Date.now();
     const output = await replicate.run(MODEL_ID, { input });
+    const generationTime = Date.now() - startTime;
 
-    // Replicate returns an array of file-like items with .url()
-    const first = Array.isArray(output) ? output[0] : output;
+    console.log(`[Pruna Flux] Generation completed in ${generationTime}ms`);
+
+    // Handle the output (Pruna returns a file-like object)
     let imageUrl = null;
 
-    if (first) {
-      if (typeof first === "string") {
-        imageUrl = first;
-      } else if (typeof first.url === "function") {
-        imageUrl = String(await first.url());
-      } else if (typeof first.url === "string") {
-        imageUrl = first.url;
+    if (output) {
+      if (typeof output === "string") {
+        imageUrl = output;
+      } else if (typeof output.url === "function") {
+        imageUrl = await output.url();
+      } else if (typeof output.url === "string") {
+        imageUrl = output.url;
+      } else if (output && typeof output === "object") {
+        // Sometimes Replicate returns the object directly
+        imageUrl = output.toString();
       }
     }
 
     if (!imageUrl) {
-      throw new Error("No image URL returned by model");
+      throw new Error("No image URL returned by Pruna Flux model");
     }
 
     // Download the image
@@ -116,9 +121,12 @@ export default async function handler(req, res) {
       .from("characters")
       .getPublicUrl(path);
 
+    console.log(`[Pruna Flux] Total processing time: ${Date.now() - startTime}ms`);
+
     res.status(200).json({
       path,
-      url: urlData.publicUrl
+      url: urlData.publicUrl,
+      generationTime: generationTime // Include timing info for debugging
     });
 
   } catch (err) {
