@@ -1,4 +1,4 @@
-// api/generate.js
+// api/generate.js - Update with the correct speed mode option
 import Replicate from "replicate";
 import { createClient } from "@supabase/supabase-js";
 import { v4 as uuidv4 } from "uuid";
@@ -41,22 +41,21 @@ export default async function handler(req, res) {
         .json({ error: "prompt, userId, characterId required" });
     }
 
-    // Updated input for Pruna AI's Flux.1-dev with lightly juiced for better quality
+    // FIXED: Use the correct speed_mode option
     const input = {
       prompt,
-      aspect_ratio: "9:16",  // Perfect for dating app portraits
-      speed_mode: "Lightly Juiced ⚡ (less speed)",  // Better quality, still fast
-      guidance: 3.5,  // Their default guidance
-      image_size: 1024,  // Base size for good quality
-      num_inference_steps: 28,  // Their recommended steps
-      output_format: "webp",  // Efficient format
-      output_quality: 80,  // 80% quality as requested
-      seed: -1,  // Random seed for variety
+      aspect_ratio: "9:16",
+      speed_mode: "Lightly Juiced 🍊 (more consistent)",  // Fixed: correct emoji and text
+      guidance: 3.5,
+      image_size: 1024,
+      num_inference_steps: 28,
+      output_format: "webp",
+      output_quality: 80,
+      seed: -1,
       ...(clientInput || {}),
     };
 
-    console.log(`[Pruna Flux] Generating for character ${characterId} with speed mode: ${input.speed_mode}`);
-    console.log(`[Pruna Flux] Prompt preview: ${prompt.substring(0, 100)}...`);
+    console.log(`[Pruna Flux] Generating for character ${characterId}`);
 
     const startTime = Date.now();
     const output = await replicate.run(MODEL_ID, { input });
@@ -64,7 +63,7 @@ export default async function handler(req, res) {
 
     console.log(`[Pruna Flux] Generation completed in ${generationTime}ms`);
 
-    // Handle the output (Pruna returns a file-like object)
+    // Handle the output
     let imageUrl = null;
 
     if (output) {
@@ -75,7 +74,6 @@ export default async function handler(req, res) {
       } else if (typeof output.url === "string") {
         imageUrl = output.url;
       } else if (output && typeof output === "object") {
-        // Sometimes Replicate returns the object directly
         imageUrl = output.toString();
       }
     }
@@ -121,12 +119,10 @@ export default async function handler(req, res) {
       .from("characters")
       .getPublicUrl(path);
 
-    console.log(`[Pruna Flux] Total processing time: ${Date.now() - startTime}ms`);
-
     res.status(200).json({
       path,
       url: urlData.publicUrl,
-      generationTime: generationTime // Include timing info for debugging
+      generationTime
     });
 
   } catch (err) {
