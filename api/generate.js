@@ -1,4 +1,4 @@
-// api/generate.js - Update with the correct speed mode option
+// api/generate.js — Uses bytedance/seedream-3 (2K-capable) with correct inputs
 import Replicate from "replicate";
 import { createClient } from "@supabase/supabase-js";
 import { v4 as uuidv4 } from "uuid";
@@ -9,8 +9,8 @@ const supabase = createClient(
   process.env.SUPABASE_SERVICE_KEY,
 );
 
-// Pruna AI's optimized Flux.1-dev
-const MODEL_ID = "prunaai/flux.1-dev:b0306d92aa025bb747dc74162f3c27d6ed83798e08e5f8977adf3d859d0536a3";
+// Seedream 3 (Bytedance) — text-to-image with native high-res support
+const MODEL_ID = "bytedance/seedream-3";
 
 const DISABLE_SAFETY =
   (process.env.DISABLE_SAFETY ?? "").toLowerCase() === "true" ||
@@ -18,18 +18,18 @@ const DISABLE_SAFETY =
 
 export default async function handler(req, res) {
   // Enable CORS
-  res.setHeader('Access-Control-Allow-Origin', '*');
-  res.setHeader('Access-Control-Allow-Methods', 'POST, OPTIONS');
-  res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
+  res.setHeader("Access-Control-Allow-Origin", "*");
+  res.setHeader("Access-Control-Allow-Methods", "POST, OPTIONS");
+  res.setHeader("Access-Control-Allow-Headers", "Content-Type");
 
-  // Handle preflight requests
-  if (req.method === 'OPTIONS') {
+  // Handle preflight
+  if (req.method === "OPTIONS") {
     return res.status(200).end();
   }
 
   // Only allow POST
-  if (req.method !== 'POST') {
-    return res.status(405).json({ error: 'Method not allowed' });
+  if (req.method !== "POST") {
+    return res.status(405).json({ error: "Method not allowed" });
   }
 
   try {
@@ -41,51 +41,154 @@ export default async function handler(req, res) {
         .json({ error: "prompt, userId, characterId required" });
     }
 
-    // FIXED: Use the correct speed_mode option
+    // Normalize and whitelist inputs for Seedream-3
+    // Allowed keys (per model schema): seed, size, width, height, prompt, aspect_ratio, guidance_scale
+    const allowedKeys = new Set([
+      "seed",
+      "size",
+      "width",
+      "height",
+      "aspect_ratio",
+      "guidance_scale",
+    ]);
+
+    const normalizedClient = {};
+    if (clientInput && typeof clientInput === "object") {
+      // Back-compat: map 'guidance' -> 'guidance_scale' if provided
+      if (
+        typeof clientInput.guidance === "number" &&
+        typeof clientInput.guidance_scale !== "number"
+      ) {
+        normalizedClient.guidance_scale = clientInput.guidance;
+      }
+      for (const [k, v] of Object.entries(clientInput)) {
+        if (allowedKeys.has(k)) normalizedClient[k] = v;
+      }
+    }
+
+    // Build model input
+    // Note: aspect_ratio may be "9:16" etc. If "custom", width/height should be provided.
     const input = {
       prompt,
-      aspect_ratio: "9:16",
-      speed_mode: "Lightly Juiced 🍊 (more consistent)",  // Fixed: correct emoji and text
-      guidance: 3.5,
-      image_size: 1024,
-      num_inference_steps: 28,
-      output_format: "webp",
-      output_quality: 80,
-      seed: -1,
-      ...(clientInput || {}),
+      aspect_ratio:
+        normalizedClient.aspect_ratio !== undefined
+          ? normalizedClient.aspect_ratio
+          : "9:16",
+      size:
+        normalizedClient.size !== undefined ? normalizedClient.size : "regular", // "regular" ~1MP. Use "big" for 2K long edge.
+      guidance_scale:
+        typeof normalizedClient.guidance_scale === "number"
+          ? normalizedClient.guidance_scale
+          : 3.5,
+      // Only include width/height if aspect_ratio is 'custom' or caller explicitly provided them
+      ...(normalizedClient.aspect_ratio === "custom" ||
+      normalizedClient.width !== undefined ||
+      normalizedClient.height !== undefined
+        ? {
+            ...(normalizedClient.width !== undefined && {
+              width: normalizedClient.width,
+            }),
+            ...(normalizedClient.height !== undefined && {
+              height: normalizedClient.height,
+            }),
+          }
+        : {}),
+      ...(typeof normalizedClient.seed === "number" && {
+        seed: normalizedClient.seed,
+      }),
     };
 
-    console.log(`[Pruna Flux] Generating for character ${characterId}`);
+    console.log(`[Seedream 3] Generating for character ${characterId}`, {
+      aspect_ratio: input.aspect_ratio,
+      size: input.size,
+      guidance_scale: input.guidance_scale,
+      hasWH: "width" in input || "height" in input,
+    });
 
     const startTime = Date.now();
     const output = await replicate.run(MODEL_ID, { input });
     const generationTime = Date.now() - startTime;
 
-    console.log(`[Pruna Flux] Generation completed in ${generationTime}ms`);
+    console.log(`[Seedream 3] Generation completed in ${generationTime}ms`);
 
-    // Handle the output
+    // Resolve output URL from Replicate response
     let imageUrl = null;
 
     if (output) {
       if (typeof output === "string") {
         imageUrl = output;
-      } else if (typeof output.url === "function") {
+      } else if (output && typeof output.url === "function") {
         imageUrl = await output.url();
-      } else if (typeof output.url === "string") {
+      } else if (output && typeof output.url === "string") {
         imageUrl = output.url;
-      } else if (output && typeof output === "object") {
-        imageUrl = output.toString();
+      } else if (typeof output === "object") {
+        // Fallback: try toString in case the SDK returns a file-like object
+        try {
+          const str = output.toString();
+          if (typeof str === "string" && str.startsWith("http")) {
+            imageUrl = str;
+          }
+        } catch {
+          /* ignore */
+        }
       }
     }
 
     if (!imageUrl) {
-      throw new Error("No image URL returned by Pruna Flux model");
+      throw new Error("No image URL returned by bytedance/seedream-3");
     }
 
     // Download the image
     const r = await fetch(imageUrl);
     if (!r.ok) {
       throw new Error(`Failed to download image: ${r.status} ${r.statusText}`);
+    }
+
+    const ab = await r.arrayBuffer();
+    const buf = Buffer.from(ab);
+    const contentType = r.headers.get("content-type") || "image/jpeg";
+
+    const ext = contentType.includes("png")
+      ? "png"
+      : contentType.includes("jpeg") || contentType.includes("jpg")
+      ? "jpg"
+      : contentType.includes("webp")
+      ? "webp"
+      : "jpg";
+
+    const filename = `${uuidv4()}.${ext}`;
+    const path = `${userId}/${characterId}/${filename}`;
+
+    // Upload to Supabase Storage
+    const { error: uploadError } = await supabase.storage
+      .from("characters")
+      .upload(path, buf, {
+        cacheControl: "3600",
+        upsert: false,
+        contentType,
+      });
+
+    if (uploadError) {
+      throw uploadError;
+    }
+
+    // Get public URL
+    const { data: urlData } = supabase.storage
+      .from("characters")
+      .getPublicUrl(path);
+
+    res.status(200).json({
+      path,
+      url: urlData.publicUrl,
+      generationTime,
+    });
+  } catch (err) {
+    console.error("[/generate] error:", err);
+    res.status(500).json({
+      error: err?.message || "Unknown error",
+    });
+  }
+}
     }
 
     const ab = await r.arrayBuffer();
