@@ -1,4 +1,4 @@
-// api/generate.js — Seedream-3, schema-faithful, JSON-only responses
+// api/generate.js — aisha-ai-official/nsfw-flux-dev, schema-faithful, JSON-only responses
 import Replicate from "replicate";
 import { createClient } from "@supabase/supabase-js";
 import { v4 as uuidv4 } from "uuid";
@@ -9,10 +9,12 @@ const supabase = createClient(
   process.env.SUPABASE_SERVICE_KEY
 );
 
-const MODEL_ID = "bytedance/seedream-3";
+// Aisha NSFW Flux Dev (hash from your example)
+const MODEL_ID =
+  "aisha-ai-official/nsfw-flux-dev:8789ec8279c4b1614014feb714fef69fea839d446b76c36f9f20e92ae7f8a952";
 
 export default async function handler(req, res) {
-  // CORS + force JSON so the client can always parse
+  // CORS + JSON
   res.setHeader("Access-Control-Allow-Origin", "*");
   res.setHeader("Access-Control-Allow-Methods", "POST, OPTIONS");
   res.setHeader("Access-Control-Allow-Headers", "Content-Type");
@@ -26,20 +28,22 @@ export default async function handler(req, res) {
   try {
     const { prompt, userId, characterId, input: clientInput } = req.body || {};
     if (!prompt || !userId || !characterId) {
-      return res.status(400).json({ error: "prompt, userId, characterId required" });
+      return res
+        .status(400)
+        .json({ error: "prompt, userId, characterId required" });
     }
 
-    // Allow only Seedream-3 schema keys; map guidance -> guidance_scale
+    // nsfw-flux-dev input schema: seed, steps, width, height, prompt, guidance_scale
     const allowedKeys = new Set([
       "seed",
-      "size",
+      "steps",
       "width",
       "height",
-      "aspect_ratio",
       "guidance_scale",
     ]);
     const sanitized = {};
     if (clientInput && typeof clientInput === "object") {
+      // back-compat: guidance -> guidance_scale
       if (
         typeof clientInput.guidance === "number" &&
         typeof clientInput.guidance_scale !== "number"
@@ -51,74 +55,79 @@ export default async function handler(req, res) {
       }
     }
 
-    // Defaults aligned with model docs; override with sanitized values
+    // Defaults aligned with model example
     const input = {
       prompt,
-      aspect_ratio: sanitized.aspect_ratio ?? "9:16",
-      size: sanitized.size ?? "regular",
+      steps: typeof sanitized.steps === "number" ? sanitized.steps : 8,
+      width: typeof sanitized.width === "number" ? sanitized.width : 1024,
+      height: typeof sanitized.height === "number" ? sanitized.height : 1024,
       guidance_scale:
-        typeof sanitized.guidance_scale === "number" ? sanitized.guidance_scale : 3.5,
-      ...(typeof sanitized.seed === "number" ? { seed: sanitized.seed } : {}),
-      ...(typeof sanitized.width === "number" ? { width: sanitized.width } : {}),
-      ...(typeof sanitized.height === "number" ? { height: sanitized.height } : {}),
+        typeof sanitized.guidance_scale === "number"
+          ? sanitized.guidance_scale
+          : 3.5,
+      seed: typeof sanitized.seed === "number" ? sanitized.seed : -1, // -1 → random
     };
 
-    console.log("[Seedream 3] Generating", { characterId, input });
+    console.log("[NSFW Flux Dev] Generating", { characterId, input });
 
     const t0 = Date.now();
     const output = await replicate.run(MODEL_ID, { input });
     const generationTime = Date.now() - t0;
 
-    // --- Normalize the 3 expected shapes: url(), raw bytes (Blob/Uint8Array), or string URL ---
+    // Model returns an ARRAY; first element has url()
+    let first = output;
+    if (Array.isArray(output)) {
+      first = output[0];
+    }
+
     let fileBuffer = null;
     let contentType = "image/jpeg";
 
-    // 1) File-like object with url()
-    if (output && typeof output === "object" && typeof output.url === "function") {
-      const imageUrl = await output.url();
+    if (first && typeof first === "object" && typeof first.url === "function") {
+      const imageUrl = await first.url();
       const r = await fetch(imageUrl);
       if (!r.ok) {
         return res
           .status(r.status || 502)
-          .json({ error: `Failed to download image: ${r.status} ${r.statusText}` });
+          .json({
+            error: `Failed to download image: ${r.status} ${r.statusText}`,
+          });
       }
       const arrayBuf = await r.arrayBuffer();
       fileBuffer = Buffer.from(arrayBuf);
       contentType = r.headers.get("content-type") || contentType;
-    }
-    // 2) Raw bytes (Blob in Node 18/20 or Uint8Array)
-    else if (
-      (typeof Blob !== "undefined" && output instanceof Blob) ||
-      output instanceof Uint8Array
-    ) {
-      const arrayBuf =
-        output instanceof Uint8Array ? output.buffer : await output.arrayBuffer();
-      fileBuffer = Buffer.from(arrayBuf);
-      if (typeof output.type === "string" && output.type) {
-        contentType = output.type;
-      }
-    }
-    // 3) Direct string URL
-    else if (typeof output === "string" && /^https?:\/\//.test(output)) {
-      const r = await fetch(output);
+    } else if (typeof first === "string" && /^https?:\/\//.test(first)) {
+      const r = await fetch(first);
       if (!r.ok) {
         return res
           .status(r.status || 502)
-          .json({ error: `Failed to download image: ${r.status} ${r.statusText}` });
+          .json({
+            error: `Failed to download image: ${r.status} ${r.statusText}`,
+          });
       }
       const arrayBuf = await r.arrayBuffer();
       fileBuffer = Buffer.from(arrayBuf);
       contentType = r.headers.get("content-type") || contentType;
-    }
-    else {
-      // Unrecognized shape — return JSON (don’t crash to HTML)
+    } else if (
+      (typeof Blob !== "undefined" && first instanceof Blob) ||
+      first instanceof Uint8Array
+    ) {
+      const arrayBuf =
+        first instanceof Uint8Array ? first.buffer : await first.arrayBuffer();
+      fileBuffer = Buffer.from(arrayBuf);
+      if (typeof first.type === "string" && first.type) {
+        contentType = first.type;
+      }
+    } else {
       return res.status(500).json({
         error: "Unrecognized model output shape",
         debug: {
-          type: typeof output,
-          hasUrlFn: !!(output && typeof output === "object" && typeof output.url === "function"),
-          isUint8Array: output instanceof Uint8Array,
-          isBlob: typeof Blob !== "undefined" && output instanceof Blob,
+          isArray: Array.isArray(output),
+          type: typeof first,
+          hasUrlFn:
+            !!(first && typeof first === "object" && typeof first.url === "function"),
+          isUint8Array: first instanceof Uint8Array,
+          isBlob: typeof Blob !== "undefined" && first instanceof Blob,
         },
       });
     }
@@ -143,10 +152,14 @@ export default async function handler(req, res) {
       });
 
     if (uploadError) {
-      return res.status(500).json({ error: uploadError.message || String(uploadError) });
+      return res
+        .status(500)
+        .json({ error: uploadError.message || String(uploadError) });
     }
 
-    const { data: urlData } = supabase.storage.from("characters").getPublicUrl(path);
+    const { data: urlData } = supabase.storage
+      .from("characters")
+      .getPublicUrl(path);
 
     return res.status(200).json({
       path,
@@ -158,4 +171,3 @@ export default async function handler(req, res) {
     return res.status(500).json({ error: err?.message || "Unknown error" });
   }
 }
-
