@@ -12,15 +12,13 @@ const supabase = createClient(
 const MODEL_ID = "bytedance/seedream-3";
 
 export default async function handler(req, res) {
-  // CORS + force JSON output so clients can always parse
+  // CORS + force JSON so the client can always parse
   res.setHeader("Access-Control-Allow-Origin", "*");
   res.setHeader("Access-Control-Allow-Methods", "POST, OPTIONS");
   res.setHeader("Access-Control-Allow-Headers", "Content-Type");
   res.setHeader("Content-Type", "application/json; charset=utf-8");
 
-  if (req.method === "OPTIONS") {
-    return res.status(200).end();
-  }
+  if (req.method === "OPTIONS") return res.status(200).end();
   if (req.method !== "POST") {
     return res.status(405).json({ error: "Method not allowed" });
   }
@@ -38,7 +36,7 @@ export default async function handler(req, res) {
       "width",
       "height",
       "aspect_ratio",
-      "guidance_scale"
+      "guidance_scale",
     ]);
     const sanitized = {};
     if (clientInput && typeof clientInput === "object") {
@@ -62,7 +60,7 @@ export default async function handler(req, res) {
         typeof sanitized.guidance_scale === "number" ? sanitized.guidance_scale : 3.5,
       ...(typeof sanitized.seed === "number" ? { seed: sanitized.seed } : {}),
       ...(typeof sanitized.width === "number" ? { width: sanitized.width } : {}),
-      ...(typeof sanitized.height === "number" ? { height: sanitized.height } : {})
+      ...(typeof sanitized.height === "number" ? { height: sanitized.height } : {}),
     };
 
     console.log("[Seedream 3] Generating", { characterId, input });
@@ -71,25 +69,59 @@ export default async function handler(req, res) {
     const output = await replicate.run(MODEL_ID, { input });
     const generationTime = Date.now() - t0;
 
-    if (!output || typeof output.url !== "function") {
-      return res.status(502).json({ error: "Model did not return a url() accessor" });
-    }
+    // --- Normalize the 3 expected shapes: url(), raw bytes (Blob/Uint8Array), or string URL ---
+    let fileBuffer = null;
+    let contentType = "image/jpeg";
 
-    const imageUrl = await output.url();
-    if (!imageUrl || typeof imageUrl !== "string") {
-      return res.status(502).json({ error: "Model returned an invalid image URL" });
+    // 1) File-like object with url()
+    if (output && typeof output === "object" && typeof output.url === "function") {
+      const imageUrl = await output.url();
+      const r = await fetch(imageUrl);
+      if (!r.ok) {
+        return res
+          .status(r.status || 502)
+          .json({ error: `Failed to download image: ${r.status} ${r.statusText}` });
+      }
+      const arrayBuf = await r.arrayBuffer();
+      fileBuffer = Buffer.from(arrayBuf);
+      contentType = r.headers.get("content-type") || contentType;
     }
-
-    // Download image, then upload to Supabase
-    const r = await fetch(imageUrl);
-    if (!r.ok) {
-      return res
-        .status(r.status || 502)
-        .json({ error: `Failed to download image: ${r.status} ${r.statusText}` });
+    // 2) Raw bytes (Blob in Node 18/20 or Uint8Array)
+    else if (
+      (typeof Blob !== "undefined" && output instanceof Blob) ||
+      output instanceof Uint8Array
+    ) {
+      const arrayBuf =
+        output instanceof Uint8Array ? output.buffer : await output.arrayBuffer();
+      fileBuffer = Buffer.from(arrayBuf);
+      if (typeof output.type === "string" && output.type) {
+        contentType = output.type;
+      }
     }
-    const arrayBuf = await r.arrayBuffer();
-    const fileBuffer = Buffer.from(arrayBuf);
-    const contentType = r.headers.get("content-type") || "image/jpeg";
+    // 3) Direct string URL
+    else if (typeof output === "string" && /^https?:\/\//.test(output)) {
+      const r = await fetch(output);
+      if (!r.ok) {
+        return res
+          .status(r.status || 502)
+          .json({ error: `Failed to download image: ${r.status} ${r.statusText}` });
+      }
+      const arrayBuf = await r.arrayBuffer();
+      fileBuffer = Buffer.from(arrayBuf);
+      contentType = r.headers.get("content-type") || contentType;
+    }
+    else {
+      // Unrecognized shape — return JSON (don’t crash to HTML)
+      return res.status(500).json({
+        error: "Unrecognized model output shape",
+        debug: {
+          type: typeof output,
+          hasUrlFn: !!(output && typeof output === "object" && typeof output.url === "function"),
+          isUint8Array: output instanceof Uint8Array,
+          isBlob: typeof Blob !== "undefined" && output instanceof Blob,
+        },
+      });
+    }
 
     const ext = contentType.includes("png")
       ? "png"
@@ -107,13 +139,11 @@ export default async function handler(req, res) {
       .upload(path, fileBuffer, {
         cacheControl: "3600",
         upsert: false,
-        contentType
+        contentType,
       });
 
     if (uploadError) {
-      return res
-        .status(500)
-        .json({ error: uploadError.message || String(uploadError) });
+      return res.status(500).json({ error: uploadError.message || String(uploadError) });
     }
 
     const { data: urlData } = supabase.storage.from("characters").getPublicUrl(path);
@@ -121,7 +151,7 @@ export default async function handler(req, res) {
     return res.status(200).json({
       path,
       url: urlData.publicUrl,
-      generationTime
+      generationTime,
     });
   } catch (err) {
     console.error("[/generate] error:", err);
