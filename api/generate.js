@@ -1,4 +1,4 @@
-// api/generate.js — bytedance/seedream-3 with robust output handling, JSON-only responses
+// api/generate.js — Seedream-3, simple + schema-faithful
 import Replicate from "replicate";
 import { createClient } from "@supabase/supabase-js";
 import { v4 as uuidv4 } from "uuid";
@@ -9,38 +9,29 @@ const supabase = createClient(
   process.env.SUPABASE_SERVICE_KEY,
 );
 
-// Use Seedream 3 (Bytedance)
 const MODEL_ID = "bytedance/seedream-3";
 
-const DISABLE_SAFETY =
-  (process.env.DISABLE_SAFETY ?? "").toLowerCase() === "true" ||
-  process.env.NODE_ENV !== "production";
-
 export default async function handler(req, res) {
-  // CORS + JSON
+  // CORS + ensure JSON output
   res.setHeader("Access-Control-Allow-Origin", "*");
   res.setHeader("Access-Control-Allow-Methods", "POST, OPTIONS");
   res.setHeader("Access-Control-Allow-Headers", "Content-Type");
   res.setHeader("Content-Type", "application/json; charset=utf-8");
 
-  if (req.method === "OPTIONS") {
-    return res.status(200).end();
-  }
+  if (req.method === "OPTIONS") return res.status(200).end();
   if (req.method !== "POST") {
     return res.status(405).json({ error: "Method not allowed" });
   }
 
   try {
     const { prompt, userId, characterId, input: clientInput } = req.body || {};
-
     if (!prompt || !userId || !characterId) {
-      return res
-        .status(400)
-        .json({ error: "prompt, userId, characterId required" });
+      return res.status(400).json({ error: "prompt, userId, characterId required" });
     }
 
-    // Map inputs supported by Seedream-3
-    // (seed, size, width, height, prompt, aspect_ratio, guidance_scale)
+    // Seedream-3 schema keys only:
+    // seed (int), size ("small"|"regular"|"big"), width (512-2048), height (512-2048),
+    // prompt (string), aspect_ratio (enum incl. "custom"), guidance_scale (1..10)
     const allowedKeys = new Set([
       "seed",
       "size",
@@ -50,17 +41,91 @@ export default async function handler(req, res) {
       "guidance_scale",
     ]);
 
-    const normalized = {};
+    const sanitized = {};
     if (clientInput && typeof clientInput === "object") {
-      // Back-compat: allow 'guidance' -> 'guidance_scale'
-      if (
-        typeof clientInput.guidance === "number" &&
-        typeof clientInput.guidance_scale !== "number"
-      ) {
-        normalized.guidance_scale = clientInput.guidance;
+      // back-compat: allow 'guidance' -> 'guidance_scale'
+      if (typeof clientInput.guidance === "number" && typeof clientInput.guidance_scale !== "number") {
+        sanitized.guidance_scale = clientInput.guidance;
       }
       for (const [k, v] of Object.entries(clientInput)) {
-        if (allowedKeys.has(k)) normalized[k] = v;
+        if (allowedKeys.has(k)) sanitized[k] = v;
+      }
+    }
+
+    // sensible defaults; override by sanitized values if provided
+    const input = {
+      prompt,
+      aspect_ratio: sanitized.aspect_ratio ?? "9:16",
+      size: sanitized.size ?? "regular",
+      guidance_scale: typeof sanitized.guidance_scale === "number" ? sanitized.guidance_scale : 3.5,
+      ...(typeof sanitized.seed === "number" ? { seed: sanitized.seed } : {}),
+      ...(typeof sanitized.width === "number" ? { width: sanitized.width } : {}),
+      ...(typeof sanitized.height === "number" ? { height: sanitized.height } : {}),
+    };
+
+    console.log(`[Seedream 3] Generating for ${characterId}`, input);
+
+    const t0 = Date.now();
+    const output = await replicate.run(MODEL_ID, { input });
+    const generationTime = Date.now() - t0;
+
+    // Official usage: get a URL from the output
+    if (!output || typeof output.url !== "function") {
+      return res.status(502).json({ error: "Model did not return a url() accessor" });
+    }
+    const imageUrl = await output.url();
+    if (!imageUrl || typeof imageUrl !== "string") {
+      return res.status(502).json({ error: "Model returned an invalid image URL" });
+    }
+
+    // Download the image so we can upload to Supabase
+    const r = await fetch(imageUrl);
+    if (!r.ok) {
+      return res
+        .status(r.status || 502)
+        .json({ error: `Failed to download image: ${r.status} ${r.statusText}` });
+    }
+    const arrayBuf = await r.arrayBuffer();
+    const fileBuffer = Buffer.from(arrayBuf);
+    const contentType = r.headers.get("content-type") || "image/jpeg";
+
+    const ext = contentType.includes("png")
+      ? "png"
+      : contentType.includes("jpeg") || contentType.includes("jpg")
+      ? "jpg"
+      : contentType.includes("webp")
+      ? "webp"
+      : "jpg";
+
+    const filename = `${uuidv4()}.${ext}`;
+    const path = `${userId}/${characterId}/${filename}`;
+
+    // Upload to Supabase Storage
+    const { error: uploadError } = await supabase.storage
+      .from("characters")
+      .upload(path, fileBuffer, {
+        cacheControl: "3600",
+        upsert: false,
+        contentType,
+      });
+
+    if (uploadError) {
+      return res.status(500).json({ error: uploadError.message || String(uploadError) });
+    }
+
+    // Public URL
+    const { data: urlData } = supabase.storage.from("characters").getPublicUrl(path);
+
+    return res.status(200).json({
+      path,
+      url: urlData.publicUrl,
+      generationTime,
+    });
+  } catch (err) {
+    console.error("[/generate] error:", err);
+    return res.status(500).json({ error: err?.message || "Unknown error" });
+  }
+}
       }
     }
 
