@@ -9,6 +9,10 @@ const IMAGE_MODEL_ID =
   "prunaai/flux.1-dev:b0306d92aa025bb747dc74162f3c27d6ed83798e08e5f8977adf3d859d0536a3";
 const VIDEO_MODEL_ID = "wan-video/wan-2.2-i2v-fast";
 
+const WEBHOOK_URL = process.env.VERCEL_URL 
+  ? `https://${process.env.VERCEL_URL}/api/generate`
+  : process.env.WEBHOOK_URL;
+
 const ALLOWED_IMAGE_KEYS = new Set([
   "seed",
   "prompt",
@@ -47,13 +51,29 @@ export default async function handler(req, res) {
   if (req.method !== "POST") return res.status(405).json({ error: "Method not allowed" });
 
   try {
-    const { type = "image", prompt, image, userId, characterId, input: clientInput } = req.body || {};
+    const body = req.body || {};
 
-    // Route to appropriate handler based on type
+    if (body.status && body.output && body.input) {
+      return await handleWebhook(req, res);
+    }
+
+    const { type = "image", prompt, image, userId, characterId, input: clientInput } = body;
+
     if (type === "video") {
-      return await handleVideoGeneration(req, res, { prompt, image, userId, characterId, clientInput });
+      return await handleVideoGeneration(req, res, {
+        prompt,
+        image,
+        userId,
+        characterId,
+        clientInput,
+      });
     } else {
-      return await handleImageGeneration(req, res, { prompt, userId, characterId, clientInput });
+      return await handleImageGeneration(req, res, {
+        prompt,
+        userId,
+        characterId,
+        clientInput,
+      });
     }
   } catch (err) {
     console.error("[/generate] error:", err);
@@ -61,7 +81,7 @@ export default async function handler(req, res) {
   }
 }
 
-// Image generation handler
+// Image generation handler (unchanged)
 async function handleImageGeneration(req, res, { prompt, userId, characterId, clientInput }) {
   if (!prompt || !userId || !characterId) {
     return res.status(400).json({ error: "prompt, userId, characterId required" });
@@ -150,10 +170,21 @@ async function handleImageGeneration(req, res, { prompt, userId, characterId, cl
   });
 }
 
-// Video generation handler
 async function handleVideoGeneration(req, res, { prompt, image, userId, characterId, clientInput }) {
   if (!prompt || !image || !userId || !characterId) {
-    return res.status(400).json({ error: "prompt, image, userId, characterId required for video generation" });
+    return res.status(400).json({
+      error: "prompt, image, userId, characterId required for video generation",
+    });
+  }
+
+  if (!WEBHOOK_URL) {
+    console.error("WEBHOOK_URL not configured:", { 
+      VERCEL_URL: process.env.VERCEL_URL,
+      WEBHOOK_URL: process.env.WEBHOOK_URL 
+    });
+    return res.status(500).json({
+      error: "Webhook URL not configured. Set WEBHOOK_URL or deploy to Vercel.",
+    });
   }
 
   const sanitized = {};
@@ -177,66 +208,99 @@ async function handleVideoGeneration(req, res, { prompt, image, userId, characte
     ...sanitized,
   };
 
-  const t0 = Date.now();
-  const output = await replicate.run(VIDEO_MODEL_ID, { input });
-  const generationTime = Date.now() - t0;
-
-  let videoUrl = null;
-  if (output && typeof output.url === "function") {
-    videoUrl = await output.url();
-  } else if (typeof output === "string") {
-    videoUrl = output;
-  }
-
-  if (!videoUrl) {
-    return res.status(500).json({
-      error: "Unexpected model output",
-      debug: { typeofOutput: typeof output, hasUrlFn: !!(output && output.url) },
-    });
-  }
-
-  const r = await fetch(videoUrl);
-  if (!r.ok) {
-    return res
-      .status(r.status || 502)
-      .json({ error: `Failed to download video: ${r.status} ${r.statusText}` });
-  }
-
-  const arrayBuf = await r.arrayBuffer();
-  const fileBuffer = Buffer.from(arrayBuf);
-  const contentType = r.headers.get("content-type") || "video/mp4";
-
-  const filename = `${uuidv4()}.mp4`;
-  const path = `${userId}/${characterId}/videos/${filename}`;
-
-  const { error: uploadError } = await supabase.storage
-    .from("characters")
-    .upload(path, fileBuffer, {
-      cacheControl: "3600",
-      upsert: false,
-      contentType,
-    });
-
-  if (uploadError) {
-    return res.status(500).json({ error: uploadError.message || String(uploadError) });
-  }
-
-  const { data: urlData } = supabase.storage.from("characters").getPublicUrl(path);
-
-  return res.status(200).json({
-    type: "video",
-    path,
-    url: urlData.publicUrl,
-    generationTime,
+  const prediction = await replicate.predictions.create({
     model: VIDEO_MODEL_ID,
-    duration: (input.num_frames / input.frames_per_second).toFixed(2) + "s",
-    used: {
-      resolution: input.resolution,
-      num_frames: input.num_frames,
-      frames_per_second: input.frames_per_second,
-      go_fast: input.go_fast,
-      sample_shift: input.sample_shift,
-      seed: sanitized.seed,
+    input,
+    webhook: WEBHOOK_URL,
+    webhook_events_filter: ["completed"],
+    webhook_metadata: {
+      userId,
+      characterId,
     },
   });
+
+  console.log(`Video generation started: ${prediction.id} for user ${userId}, character ${characterId}`);
+
+  return res.status(202).json({
+    type: "video",
+    status: "processing",
+    message: "Video generation started",
+    predictionId: prediction.id,
+  });
+}
+
+async function handleWebhook(req, res) {
+  const prediction = req.body;
+
+  console.log("Webhook received:", {
+    id: prediction.id,
+    status: prediction.status,
+    hasOutput: !!prediction.output,
+  });
+
+  if (prediction?.status !== "succeeded") {
+    console.error("Webhook received for non-successful prediction:", prediction);
+    return res.status(200).json({ message: "Ignoring non-successful prediction" });
+  }
+
+  const videoUrl = prediction.output;
+  if (!videoUrl) {
+    console.error("Webhook payload missing output URL:", prediction);
+    return res.status(400).json({ error: "Webhook payload missing output URL" });
+  }
+
+  const { userId, characterId } = prediction.webhook_metadata || {};
+  if (!userId || !characterId) {
+    console.error("Webhook payload missing metadata:", prediction);
+    return res.status(400).json({ error: "Webhook payload missing metadata" });
+  }
+
+  try {
+    const r = await fetch(videoUrl);
+    if (!r.ok) throw new Error(`Failed to download video: ${r.status}`);
+
+    const fileBuffer = Buffer.from(await r.arrayBuffer());
+    const contentType = r.headers.get("content-type") || "video/mp4";
+    const filename = `${uuidv4()}.mp4`;
+    const path = `${userId}/${characterId}/videos/${filename}`;
+
+    const { error: uploadError } = await supabase.storage
+      .from("characters")
+      .upload(path, fileBuffer, {
+        cacheControl: "3600",
+        upsert: false,
+        contentType,
+      });
+
+    if (uploadError) throw uploadError;
+
+    const { data: urlData } = supabase.storage.from("characters").getPublicUrl(path);
+
+    const { error: insertError } = await supabase.from("messages").insert({
+      character_id: characterId,
+      user_id: userId,
+      role: "assistant",
+      content: "Here's the video!",
+      video_url: path, // Store the path, not the full URL
+      created_at: new Date().toISOString(),
+    });
+
+    if (insertError) throw insertError;
+
+    console.log(`Video processed successfully for user ${userId}, character ${characterId}`);
+
+    return res.status(200).json({ 
+      success: true,
+      path,
+      url: urlData.publicUrl,
+    });
+  } catch (err) {
+    console.error(
+      `Webhook processing failed for user ${userId}, character ${characterId}:`,
+      err
+    );
+    return res.status(500).json({ 
+      error: `Webhook processing failed: ${err.message}` 
+    });
+  }
 }
