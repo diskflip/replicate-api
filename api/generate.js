@@ -1,3 +1,4 @@
+
 import Replicate from "replicate";
 import { createClient } from "@supabase/supabase-js";
 import { v4 as uuidv4 } from "uuid";
@@ -9,7 +10,7 @@ const IMAGE_MODEL_ID =
   "prunaai/flux.1-dev:b0306d92aa025bb747dc74162f3c27d6ed83798e08e5f8977adf3d859d0536a3";
 const VIDEO_MODEL_ID = "wan-video/wan-2.2-i2v-fast";
 
-const WEBHOOK_URL = process.env.VERCEL_URL 
+const WEBHOOK_URL = process.env.VERCEL_URL
   ? `https://${process.env.VERCEL_URL}/api/generate`
   : process.env.WEBHOOK_URL;
 
@@ -177,9 +178,9 @@ async function handleVideoGeneration(req, res, { prompt, image, userId, characte
   }
 
   if (!WEBHOOK_URL) {
-    console.error("WEBHOOK_URL not configured:", { 
+    console.error("WEBHOOK_URL not configured:", {
       VERCEL_URL: process.env.VERCEL_URL,
-      WEBHOOK_URL: process.env.WEBHOOK_URL 
+      WEBHOOK_URL: process.env.WEBHOOK_URL,
     });
     return res.status(500).json({
       error: "Webhook URL not configured. Set WEBHOOK_URL or deploy to Vercel.",
@@ -234,12 +235,11 @@ async function handleWebhook(req, res) {
 
   if (prediction?.status !== "succeeded") {
     console.error("Webhook received for non-successful prediction:", prediction);
-    return res
-      .status(200)
-      .json({ message: "Ignoring non-successful prediction." });
+    return res.status(200).json({ message: "Ignoring non-successful prediction." });
   }
 
-  const videoUrl = prediction.output;
+  const videoUrl = Array.isArray(prediction.output) ? prediction.output[0] : prediction.output;
+
   if (!videoUrl) {
     console.error("Webhook payload missing output URL:", prediction);
     return res.status(400).json({ error: "Webhook payload missing output URL" });
@@ -282,13 +282,7 @@ async function handleWebhook(req, res) {
 
     return res.status(200).json({ success: true });
   } catch (err) {
-    console.error(
-      `Webhook processing failed for user ${userId}, character ${characterId}:`,
-      err,
-    );
-    return res
-      .status(500)
-      .json({ error: `Webhook processing failed: ${err.message}` });
+    console.error(`Webhook processing failed for user ${userId}, character ${characterId}:`, err);
+    return res.status(500).json({ error: `Webhook processing failed: ${err.message}` });
   }
 }
-
