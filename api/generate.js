@@ -9,8 +9,6 @@ const IMAGE_MODEL_ID =
   "prunaai/flux.1-dev:b0306d92aa025bb747dc74162f3c27d6ed83798e08e5f8977adf3d859d0536a3";
 const VIDEO_MODEL_ID = "wan-video/wan-2.2-i2v-fast";
 
-// IMPORTANT: Set this in your Vercel environment variables
-// Example: https://your-app.vercel.app/api/generate
 const WEBHOOK_URL = process.env.VERCEL_URL 
   ? `https://${process.env.VERCEL_URL}/api/generate`
   : process.env.WEBHOOK_URL;
@@ -55,12 +53,10 @@ export default async function handler(req, res) {
   try {
     const body = req.body || {};
 
-    // Check if this is a webhook callback from Replicate
     if (body.status && body.output && body.input) {
       return await handleWebhook(req, res);
     }
 
-    // Otherwise, treat it as a generation request from the client
     const { type = "image", prompt, image, userId, characterId, input: clientInput } = body;
 
     if (type === "video") {
@@ -85,7 +81,6 @@ export default async function handler(req, res) {
   }
 }
 
-// Image generation handler (unchanged)
 async function handleImageGeneration(req, res, { prompt, userId, characterId, clientInput }) {
   if (!prompt || !userId || !characterId) {
     return res.status(400).json({ error: "prompt, userId, characterId required" });
@@ -174,7 +169,6 @@ async function handleImageGeneration(req, res, { prompt, userId, characterId, cl
   });
 }
 
-// MODIFIED Video generation handler - now asynchronous
 async function handleVideoGeneration(req, res, { prompt, image, userId, characterId, clientInput }) {
   if (!prompt || !image || !userId || !characterId) {
     return res.status(400).json({
@@ -213,13 +207,11 @@ async function handleVideoGeneration(req, res, { prompt, image, userId, characte
     ...sanitized,
   };
 
-  // Pass metadata in the input itself
   input._meta = {
     userId,
     characterId,
   };
 
-  // Start the prediction with webhook
   const prediction = await replicate.predictions.create({
     model: VIDEO_MODEL_ID,
     input,
@@ -229,7 +221,6 @@ async function handleVideoGeneration(req, res, { prompt, image, userId, characte
 
   console.log(`Video generation started: ${prediction.id} for user ${userId}, character ${characterId}`);
 
-  // Immediately respond that the job has started
   return res.status(202).json({
     type: "video",
     status: "processing",
@@ -238,19 +229,14 @@ async function handleVideoGeneration(req, res, { prompt, image, userId, characte
   });
 }
 
-// NEW Webhook handler for when Replicate finishes
 async function handleWebhook(req, res) {
   const prediction = req.body;
 
-  console.log("Webhook received:", {
-    id: prediction.id,
-    status: prediction.status,
-    hasOutput: !!prediction.output,
-  });
-
   if (prediction?.status !== "succeeded") {
     console.error("Webhook received for non-successful prediction:", prediction);
-    return res.status(200).json({ message: "Ignoring non-successful prediction" });
+    return res
+      .status(200)
+      .json({ message: "Ignoring non-successful prediction." });
   }
 
   const videoUrl = prediction.output;
@@ -259,15 +245,13 @@ async function handleWebhook(req, res) {
     return res.status(400).json({ error: "Webhook payload missing output URL" });
   }
 
-  // Get metadata from input._meta field
-  const { userId, characterId } = prediction.input?._meta || {};
+  const { userId, characterId } = prediction.input._meta || {};
   if (!userId || !characterId) {
-    console.error("Webhook payload missing metadata:", prediction);
+    console.error("Webhook payload missing metadata:", prediction.input);
     return res.status(400).json({ error: "Webhook payload missing metadata" });
   }
 
   try {
-    // Download the video
     const r = await fetch(videoUrl);
     if (!r.ok) throw new Error(`Failed to download video: ${r.status}`);
 
@@ -276,7 +260,6 @@ async function handleWebhook(req, res) {
     const filename = `${uuidv4()}.mp4`;
     const path = `${userId}/${characterId}/videos/${filename}`;
 
-    // Upload to Supabase storage
     const { error: uploadError } = await supabase.storage
       .from("characters")
       .upload(path, fileBuffer, {
@@ -287,35 +270,25 @@ async function handleWebhook(req, res) {
 
     if (uploadError) throw uploadError;
 
-    // Get public URL
-    const { data: urlData } = supabase.storage.from("characters").getPublicUrl(path);
-
-    // Store just the path in the database (not the full URL)
     const { error: insertError } = await supabase.from("messages").insert({
       character_id: characterId,
       user_id: userId,
       role: "assistant",
-      content: "Here's the video!",
-      video_url: path, // Store the path, not the full URL
-      created_at: new Date().toISOString(),
+      content: null,
+      video_url: path,
     });
 
     if (insertError) throw insertError;
 
-    console.log(`Video processed successfully for user ${userId}, character ${characterId}`);
-
-    return res.status(200).json({ 
-      success: true,
-      path,
-      url: urlData.publicUrl,
-    });
+    return res.status(200).json({ success: true });
   } catch (err) {
     console.error(
       `Webhook processing failed for user ${userId}, character ${characterId}:`,
-      err
+      err,
     );
-    return res.status(500).json({ 
-      error: `Webhook processing failed: ${err.message}` 
-    });
+    return res
+      .status(500)
+      .json({ error: `Webhook processing failed: ${err.message}` });
   }
 }
+
