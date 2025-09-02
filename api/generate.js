@@ -137,19 +137,11 @@ async function handleVideoGeneration(req, res, { prompt, image, userId, characte
       .upload(path, fileBuffer, { contentType });
     if (uploadError) throw uploadError;
 
-    const { error: insertError } = await supabase.from("messages").insert({
-      character_id: characterId,
-      user_id: userId,
-      role: "assistant",
-      content: null,
-      video_url: path,
-    });
-    if (insertError) throw insertError;
+    const { data: urlData } = supabase.storage.from("characters").getPublicUrl(path);
 
-    return res.status(200).json({ success: true, message: "Video processed and message created." });
+    return res.status(200).json({ type: "video", path, url: urlData.publicUrl });
   } catch (err) {
     console.error(`[handleVideoGeneration] error for user ${userId}:`, err);
     return res.status(500).json({ error: err.message || "An unknown error occurred during video processing." });
   }
 }
-
