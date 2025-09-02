@@ -20,6 +20,7 @@ const ALLOWED_VIDEO_KEYS = new Set([
   "sample_shift", "frames_per_second", "disable_safety_checker",
   "lora_scale_transformer", "lora_scale_transformer_2",
   "lora_weights_transformer", "lora_weights_transformer_2",
+  "text",
 ]);
 
 export default async function handler(req, res) {
@@ -157,12 +158,26 @@ async function handleVideoGeneration(res, { prompt, image, userId, characterId, 
       throw uploadError;
     }
 
-    console.log("[handleVideoGeneration] Supabase upload successful. Retrieving public URL...");
+    console.log("[handleVideoGeneration] Supabase upload successful.");
+
+    console.log("[handleVideoGeneration] Inserting video message into the database...");
+    const { error: dbError } = await supabase.from("messages").insert({
+      user_id: userId,
+      character_id: characterId,
+      role: "assistant",
+      content: clientInput?.text || null,
+      video_url: path,
+    });
+
+    if (dbError) {
+      console.error("[handleVideoGeneration] Failed to insert message into DB:", JSON.stringify(dbError, null, 2));
+    } else {
+      console.log("[handleVideoGeneration] Successfully inserted message into the database.");
+    }
 
     const { data: urlData } = supabase.storage.from("characters").getPublicUrl(path);
-
     if (!urlData || !urlData.publicUrl) {
-      console.error("[handleVideoGeneration] Upload succeeded, but failed to get public URL. URL data:", urlData);
+      console.error("[handleVideoGeneration] Upload succeeded, but failed to get public URL.");
       throw new Error("Could not retrieve public URL for the video.");
     }
 
