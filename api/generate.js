@@ -3,96 +3,118 @@ import { createClient } from "@supabase/supabase-js";
 import { v4 as uuidv4 } from "uuid";
 
 const replicate = new Replicate({ auth: process.env.REPLICATE_API_TOKEN });
-const supabase = createClient(process.env.SUPABASE_URL as string, process.env.SUPABASE_SERVICE_KEY as string);
+const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SERVICE_KEY);
 
-// New model IDs (Replicate)
+// Replicate model IDs
 const IMAGE_MODEL_ID = "google/imagen-4";
 const VIDEO_MODEL_ID = "kwaivgi/kling-v2.1";
 
-// Allow both legacy and new model keys (non-breaking)
+// Allowed inputs (legacy + new)
 const ALLOWED_IMAGE_KEYS = new Set([
-  // legacy
-  "seed", "prompt", "guidance", "image_size", "speed_mode", "aspect_ratio",
-  "output_format", "output_quality", "num_inference_steps",
-  // imagen-4 specific
-  "safety_filter_level"
+  "seed","prompt","guidance","image_size","speed_mode","aspect_ratio",
+  "output_format","output_quality","num_inference_steps",
+  "safety_filter_level",
 ]);
 
 const ALLOWED_VIDEO_KEYS = new Set([
-  // legacy wan-video keys
-  "seed", "prompt", "image", "go_fast", "num_frames", "resolution",
-  "sample_shift", "frames_per_second", "disable_safety_checker",
-  "lora_scale_transformer", "lora_scale_transformer_2",
-  "lora_weights_transformer", "lora_weights_transformer_2",
+  "seed","prompt","image","go_fast","num_frames","resolution",
+  "sample_shift","frames_per_second","disable_safety_checker",
+  "lora_scale_transformer","lora_scale_transformer_2",
+  "lora_weights_transformer","lora_weights_transformer_2",
   "text",
-  // kling v2.1 inputs
-  "mode", "duration", "start_image", "negative_prompt"
+  "mode","duration","start_image","negative_prompt",
 ]);
 
-function extractUrl(output: any): string | null {
+function extractUrl(output) {
   if (!output) return null;
   if (Array.isArray(output)) return output[0] ?? null;
   if (typeof output === "string") return output;
   if (typeof output === "object") {
-    if (typeof (output as any).url === "function") return (output as any).url();
-    if (typeof (output as any).url === "string") return (output as any).url;
-    if (typeof (output as any).output === "string") return (output as any).output;
+    if (typeof output.url === "function") return output.url();
+    if (typeof output.url === "string") return output.url;
+    if (typeof output.output === "string") return output.output;
   }
   return null;
 }
 
-export default async function handler(req: any, res: any) {
+function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
+
+async function runWithRetry(model, input, tries = 2) {
+  let lastErr = null;
+  for (let i = 0; i < tries; i++) {
+    try {
+      return await replicate.run(model, { input });
+    } catch (err) {
+      lastErr = err;
+      const name = err?.name || "Error";
+      const msg = err?.message || String(err);
+      const status = err?.status;
+      const logs = err?.prediction?.logs;
+      const detail = err?.prediction?.error || err?.error;
+      console.error(`[replicate.run] ${name} status=${status} msg=${msg}`);
+      if (logs) console.error(`[replicate.run] logs: ${logs}`);
+      if (detail) console.error(`[replicate.run] detail: ${JSON.stringify(detail)}`);
+      if (i < tries - 1) {
+        const jitter = 300 + Math.floor(Math.random() * 500);
+        console.log(`[replicate.run] retrying in ${jitter}ms...`);
+        await sleep(jitter);
+      }
+    }
+  }
+  throw lastErr;
+}
+
+export default async function handler(req, res) {
   res.setHeader("Access-Control-Allow-Origin", "*");
   res.setHeader("Access-Control-Allow-Methods", "POST, OPTIONS");
   res.setHeader("Access-Control-Allow-Headers", "Content-Type");
   res.setHeader("Content-Type", "application/json; charset=utf-8");
 
-  if (req.method === "OPTIONS") {
-    return res.status(200).end();
-  }
-  if (req.method !== "POST") {
-    return res.status(405).json({ error: "Method not allowed" });
-  }
+  if (req.method === "OPTIONS") return res.status(200).end();
+  if (req.method !== "POST") return res.status(405).json({ error: "Method not allowed" });
 
   try {
     const { type = "image", prompt, image, userId, characterId, input: clientInput } = req.body || {};
-
     if (type === "video") {
       return await handleVideoGeneration(res, { prompt, image, userId, characterId, clientInput });
     } else {
       return await handleImageGeneration(res, { prompt, userId, characterId, clientInput });
     }
-  } catch (err: any) {
+  } catch (err) {
     return res.status(500).json({ error: err?.message || "Unknown error in handler" });
   }
 }
 
-async function handleImageGeneration(
-  res: any,
-  { prompt, userId, characterId, clientInput }: { prompt: string; userId: string; characterId: string; clientInput?: Record<string, any> }
-) {
+async function handleImageGeneration(res, { prompt, userId, characterId, clientInput }) {
   if (!prompt || !userId || !characterId) {
     return res.status(400).json({ error: "prompt, userId, characterId required" });
   }
 
-  const sanitized: Record<string, any> = {};
+  const sanitized = {};
   if (clientInput && typeof clientInput === "object") {
     for (const [k, v] of Object.entries(clientInput)) {
       if (ALLOWED_IMAGE_KEYS.has(k) && v !== undefined && v !== null) sanitized[k] = v;
     }
   }
 
-  // Imagen-4 expects: prompt, aspect_ratio?, safety_filter_level?
   const input = {
     prompt,
-    ...(sanitized.aspect_ratio ? { aspect_ratio: sanitized.aspect_ratio } : {}),
-    ...(sanitized.safety_filter_level ? { safety_filter_level: sanitized.safety_filter_level } : {})
+    aspect_ratio: sanitized.aspect_ratio || "4:3",
+    safety_filter_level: sanitized.safety_filter_level || "block_medium_and_above",
   };
 
-  const output = await replicate.run(IMAGE_MODEL_ID, { input });
+  let output;
+  try {
+    console.log("[handleImageGeneration] replicate.run -> imagen-4");
+    output = await runWithRetry(IMAGE_MODEL_ID, input, 2);
+  } catch (err) {
+    const msg = err?.message || "Image generation failed";
+    return res.status(err?.status || 500).json({ error: msg });
+  }
+
   const imageUrl = extractUrl(output);
   if (!imageUrl) {
-    return res.status(500).json({ error: "Image generation failed" });
+    return res.status(500).json({ error: "Image generation failed (no URL)" });
   }
 
   const r = await fetch(imageUrl);
@@ -115,40 +137,43 @@ async function handleImageGeneration(
   return res.status(200).json({ type: "image", path, url: urlData.publicUrl });
 }
 
-async function handleVideoGeneration(
-  res: any,
-  { prompt, image, userId, characterId, clientInput }: { prompt: string; image?: string; userId: string; characterId: string; clientInput?: Record<string, any> }
-) {
+async function handleVideoGeneration(res, { prompt, image, userId, characterId, clientInput }) {
   if (!prompt || !userId || !characterId) {
     return res.status(400).json({ error: "prompt, userId, characterId required" });
   }
 
-  const sanitized: Record<string, any> = {};
+  const sanitized = {};
   if (clientInput && typeof clientInput === "object") {
     for (const [k, v] of Object.entries(clientInput)) {
       if (ALLOWED_VIDEO_KEYS.has(k) && v !== undefined && v !== null) sanitized[k] = v;
     }
   }
 
-  // kling expects: prompt, start_image (optional but we use it), mode?, duration?, negative_prompt?
-  // Preserve your API: accept legacy `image` and map to `start_image` if caller didn't pass start_image.
-  const start_image = (sanitized.start_image as string) ?? image;
+  const start_image = sanitized.start_image ?? image;
   if (!start_image) {
     return res.status(400).json({ error: "image or start_image required for video" });
   }
 
-  const input: Record<string, any> = {
+  const input = {
     prompt,
     start_image,
     ...(sanitized.mode ? { mode: sanitized.mode } : {}),
     ...(sanitized.duration ? { duration: sanitized.duration } : {}),
-    ...(typeof sanitized.negative_prompt === "string" ? { negative_prompt: sanitized.negative_prompt } : {})
+    ...(typeof sanitized.negative_prompt === "string" ? { negative_prompt: sanitized.negative_prompt } : {}),
   };
 
-  const output = await replicate.run(VIDEO_MODEL_ID, { input });
+  let output;
+  try {
+    console.log("[handleVideoGeneration] replicate.run -> kling-v2.1");
+    output = await runWithRetry(VIDEO_MODEL_ID, input, 2);
+  } catch (err) {
+    const msg = err?.message || "Video generation failed";
+    return res.status(err?.status || 500).json({ error: msg });
+  }
+
   const videoUrl = extractUrl(output);
   if (!videoUrl) {
-    return res.status(500).json({ error: "Video generation failed to produce a URL." });
+    return res.status(500).json({ error: "Video generation failed (no URL)" });
   }
 
   const r = await fetch(videoUrl);
@@ -166,18 +191,21 @@ async function handleVideoGeneration(
     return res.status(500).json({ error: uploadError.message || String(uploadError) });
   }
 
-  // Preserve your existing DB insert of a video message with optional text
   if (clientInput && typeof clientInput.text === "string") {
-    await supabase.from("messages").insert({
-      user_id: userId,
-      character_id: characterId,
-      role: "assistant",
-      content: clientInput.text || null,
-      video_url: path
-    }).catch(() => {});
+    try {
+      await supabase.from("messages").insert({
+        user_id: userId,
+        character_id: characterId,
+        role: "assistant",
+        content: clientInput.text || null,
+        video_url: path,
+      });
+    } catch {}
   }
 
   const { data: urlData } = supabase.storage.from("characters").getPublicUrl(path);
   return res.status(200).json({ type: "video", path, url: urlData.publicUrl });
 }
+
+
 
