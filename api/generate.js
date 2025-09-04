@@ -99,7 +99,7 @@ async function handleImageGeneration(res, { prompt, userId, characterId, clientI
 
   const input = {
     prompt,
-    aspect_ratio: sanitized.aspect_ratio || "4:5",
+    aspect_ratio: sanitized.aspect_ratio || "9:16",
     safety_filter_level: sanitized.safety_filter_level || "block_medium_and_above",
   };
 
